@@ -35,6 +35,35 @@ fn parse_devices(device_args: Vec<String>) -> Vec<String> {
     devices
 }
 
+// run something against every device at once, bail out if any of them fail
+fn run_on_all_devices<F>(devices: &[String], what: &str, f: F)
+where
+    F: Fn(&str) -> std::io::Result<()> + Sync,
+{
+    let f = &f;
+    let failed = std::thread::scope(|s| {
+        let handles: Vec<_> = devices
+            .iter()
+            .map(|d| {
+                s.spawn(move || match f(d) {
+                    Ok(()) => {
+                        println!("  ✓ {}", d);
+                        false
+                    }
+                    Err(e) => {
+                        eprintln!("Error {} device {}: {}", what, d, e);
+                        true
+                    }
+                })
+            })
+            .collect();
+        handles.into_iter().any(|h| h.join().unwrap())
+    });
+    if failed {
+        std::process::exit(1);
+    }
+}
+
 fn main() {
     let args = Args::parse();
 
@@ -50,40 +79,19 @@ fn main() {
         format!("{} devices", devices.len())
     };
 
-    // Create file device if requested (only for first device)
+    // Create file devices if requested (all of them, in parallel)
     if args.create_file {
-        if let Err(e) = engine::create_file_device(&devices[0], args.file_size) {
-            eprintln!("Error creating file device: {}", e);
-            std::process::exit(1);
-        }
-        println!("File device created successfully");
+        println!("Creating {} file device{}...", devices.len(), if devices.len() == 1 { "" } else { "s" });
+        let size_gb = args.file_size;
+        run_on_all_devices(&devices, "creating", |d| engine::create_file_device(d, size_gb));
+        println!("All file devices created successfully");
         println!();
     }
 
     // Prep device if requested (all devices in parallel)
     if args.prep {
         println!("Preparing {} device{}...", devices.len(), if devices.len() == 1 { "" } else { "s" });
-
-        let mut handles = Vec::new();
-        for device in devices.clone() {
-            let handle = std::thread::spawn(move || {
-                if let Err(e) = engine::prep_device(&device) {
-                    eprintln!("Error preparing device {}: {}", device, e);
-                    Err(e)
-                } else {
-                    println!("  ✓ {}", device);
-                    Ok(())
-                }
-            });
-            handles.push(handle);
-        }
-
-        // Wait for all preps to complete and check for errors
-        for handle in handles {
-            if handle.join().unwrap().is_err() {
-                std::process::exit(1);
-            }
-        }
+        run_on_all_devices(&devices, "preparing", engine::prep_device);
         println!("All devices prepared successfully");
         println!();
     }

@@ -26,3 +26,7 @@ go.work
 # OS
 .DS_Store
 Thumbs.db
+
+# target
+/target/
+/x86_64-unknown-linux-musl
