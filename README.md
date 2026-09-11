@@ -195,30 +195,8 @@ src/
 | **JSON output** | ✅ | ✅ | ❌ | ✅ |
 | **Single binary** | ✅ | ❌ | ❌ | ✅ |
 
-## Known Limitations
-
-- Linux io_uring requires kernel 5.1+
-- Windows requires Windows 10+
-- Direct I/O alignment is strict (4 KB sector size assumed)
-
-## Recent Enhancements
-
-- [x] **Batched I/O completions** — `GetQueuedCompletionStatusEx` on Windows for better throughput
-- [x] **Multi-device testing** — Test multiple devices simultaneously with aggregate metrics
-- [x] **Windows shorthand paths** — Use `4` instead of `\\.\PhysicalDrive4`
-
-## Future Enhancements
-
-- [ ] GUI (JavaScript/WebView like original)
-- [ ] Mixed read/write workload support
-- [ ] Sequential read/write patterns
-- [ ] Network storage (NFS/SMB) support
-- [ ] Preconfigured profiles (database, video, etc.)
-
 ## Contributing
 
 Found a bug or have a suggestion? Check the source code in `src/` and feel free to file issues.
 
----
 
-**Binary size**: 810 KB (Windows) | Compiled with: Rust 1.75+ | Release optimizations: LTO + single codegen unit
