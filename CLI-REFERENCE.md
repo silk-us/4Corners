@@ -123,6 +123,12 @@ Block size is the amount of data transferred per I/O operation, specified in KB.
 
 Use `--create-file` to benchmark against a file instead of a raw device. Use `--prep` to pre-condition a device with random data for accurate first-write performance.
 
+Both apply to every device in the list and run in parallel. Notes:
+
+- `--create-file` already fills each new file with random data, so `--prep` is skipped when both flags are given.
+- `--create-file` only works with file paths, not raw devices.
+- `--prep` works fine on existing files — handy for re-normalizing a file after a write test.
+
 ## Multi-Device Testing
 
 Test multiple devices simultaneously to achieve aggregate performance across devices. Results are combined:
@@ -132,6 +138,8 @@ Test multiple devices simultaneously to achieve aggregate performance across dev
 - **Latency**: Averaged across all devices
 
 ### Specifying Multiple Devices
+
+The device list is checked before anything runs. Listing the same device twice, or mixing raw devices with file paths in one run, is rejected with an error.
 
 **Windows:**
 ```powershell
@@ -236,6 +244,16 @@ sudo ./4c --device /dev/nvme0n1 --device /dev/nvme1n1 --device /dev/nvme2n1 --te
 ### Multi-device: Prep and benchmark multiple drives in parallel (Linux)
 ```bash
 sudo ./4c --device "/dev/sdb,/dev/sdc,/dev/sdd" --prep --read-iops-threads 256 --write-iops-threads 256
+```
+
+### Multi-device: Create two 20 GB test files, then benchmark (Windows)
+```powershell
+./4c --device "E:\test\file1,E:\test\file2" --create-file --file-size 20
+```
+
+### Multi-device: Re-prep existing test files before another run (Windows)
+```powershell
+./4c --device "E:\test\file1,E:\test\file2" --prep
 ```
 
 ## Output

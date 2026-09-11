@@ -8,60 +8,74 @@ use engine::TestConfig;
 use report::BenchmarkReport;
 use std::path::Path;
 
-/// Parse device argument(s) and normalize Windows paths
-fn parse_devices(device_args: Vec<String>) -> Vec<String> {
-    let mut devices = Vec::new();
+pub fn plural(n: usize) -> &'static str {
+    if n == 1 { "" } else { "s" }
+}
+
+// raw disk/volume vs a plain file
+fn is_raw_device(path: &str) -> bool {
+    path.starts_with(r"\\.\") || path.starts_with("/dev/")
+}
+
+/// Parse device argument(s), normalize Windows paths, sanity check the list
+fn parse_devices(device_args: Vec<String>) -> Result<Vec<String>, String> {
+    let mut devices: Vec<String> = Vec::new();
 
     for arg in device_args {
         // Handle comma-separated values
         for part in arg.split(',') {
             let trimmed = part.trim();
-            if !trimmed.is_empty() {
-                #[cfg(windows)]
-                let normalized = engine::normalize_device_path(trimmed);
-                #[cfg(not(windows))]
-                let normalized = trimmed.to_string();
-
-                devices.push(normalized);
+            if trimmed.is_empty() {
+                continue;
             }
+            #[cfg(windows)]
+            let normalized = engine::normalize_device_path(trimmed);
+            #[cfg(not(windows))]
+            let normalized = trimmed.to_string();
+
+            // same device twice is almost always a typo, dont guess
+            if devices.iter().any(|d| d.eq_ignore_ascii_case(&normalized)) {
+                return Err(format!("device {} is listed more than once", normalized));
+            }
+            devices.push(normalized);
         }
     }
 
     if devices.is_empty() {
-        eprintln!("Error: No valid devices specified");
-        std::process::exit(1);
+        return Err("no valid devices specified".to_string());
     }
 
-    devices
+    // raw devices and files never mix
+    let raw = devices.iter().filter(|d| is_raw_device(d)).count();
+    if raw > 0 && raw < devices.len() {
+        return Err("raw devices and file paths cannot be mixed in the same run".to_string());
+    }
+
+    Ok(devices)
 }
 
-// run something against every device at once, bail out if any of them fail
-fn run_on_all_devices<F>(devices: &[String], what: &str, f: F)
+// run something against every device at once, first error wins
+fn run_on_all_devices<F>(devices: &[String], f: F) -> std::io::Result<()>
 where
     F: Fn(&str) -> std::io::Result<()> + Sync,
 {
     let f = &f;
-    let failed = std::thread::scope(|s| {
+    std::thread::scope(|s| {
         let handles: Vec<_> = devices
             .iter()
             .map(|d| {
-                s.spawn(move || match f(d) {
-                    Ok(()) => {
-                        println!("  ✓ {}", d);
-                        false
+                s.spawn(move || {
+                    let result = f(d);
+                    match &result {
+                        Ok(()) => println!("  ✓ {}", d),
+                        Err(e) => eprintln!("  ✗ {}: {}", d, e),
                     }
-                    Err(e) => {
-                        eprintln!("Error {} device {}: {}", what, d, e);
-                        true
-                    }
+                    result
                 })
             })
             .collect();
-        handles.into_iter().any(|h| h.join().unwrap())
-    });
-    if failed {
-        std::process::exit(1);
-    }
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    })
 }
 
 fn main() {
@@ -72,7 +86,13 @@ fn main() {
     println!();
 
     // Parse and normalize device list
-    let devices = parse_devices(args.device);
+    let devices = match parse_devices(args.device) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
     let device_display = if devices.len() == 1 {
         devices[0].clone()
     } else {
@@ -81,17 +101,30 @@ fn main() {
 
     // Create file devices if requested (all of them, in parallel)
     if args.create_file {
-        println!("Creating {} file device{}...", devices.len(), if devices.len() == 1 { "" } else { "s" });
-        let size_gb = args.file_size;
-        run_on_all_devices(&devices, "creating", |d| engine::create_file_device(d, size_gb));
+        if devices.iter().any(|d| is_raw_device(d)) {
+            eprintln!("Error: --create-file only works with file paths, not raw devices");
+            std::process::exit(1);
+        }
+        println!("Creating {} file device{} ({} GB each)...", devices.len(), plural(devices.len()), args.file_size);
+        if run_on_all_devices(&devices, |d| engine::create_file_device(d, args.file_size)).is_err() {
+            eprintln!("Error: file creation failed");
+            std::process::exit(1);
+        }
         println!("All file devices created successfully");
         println!();
     }
 
-    // Prep device if requested (all devices in parallel)
-    if args.prep {
-        println!("Preparing {} device{}...", devices.len(), if devices.len() == 1 { "" } else { "s" });
-        run_on_all_devices(&devices, "preparing", engine::prep_device);
+    // Prep devices if requested (all devices in parallel)
+    // new files are already full of random data so prep is pointless right after create
+    if args.prep && args.create_file {
+        println!("Skipping --prep: --create-file already fills the files with random data");
+        println!();
+    } else if args.prep {
+        println!("Preparing {} device{}...", devices.len(), plural(devices.len()));
+        if run_on_all_devices(&devices, engine::prep_device).is_err() {
+            eprintln!("Error: device prep failed");
+            std::process::exit(1);
+        }
         println!("All devices prepared successfully");
         println!();
     }

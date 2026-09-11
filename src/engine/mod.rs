@@ -109,7 +109,7 @@ pub fn run_test(config: &TestConfig) -> io::Result<TestResult> {
         "  Total device size: {:.2} GB ({} device{})",
         total_size as f64 / (1024.0 * 1024.0 * 1024.0),
         config.device_paths.len(),
-        if config.device_paths.len() == 1 { "" } else { "s" }
+        crate::plural(config.device_paths.len())
     );
 
     let start = Instant::now();

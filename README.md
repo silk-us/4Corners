@@ -30,6 +30,9 @@ A high-performance disk I/O benchmark utility that measures the "4 corners" of s
 
 # Or with full paths
 4c --device \\.\PhysicalDrive4 --device \\.\PhysicalDrive5
+
+# Or multiple test files - all get created (and filled with random data)
+4c --device "E:\test\file1,E:\test\file2" --create-file --file-size 20
 ```
 
 ### Async I/O
@@ -44,8 +47,9 @@ A high-performance disk I/O benchmark utility that measures the "4 corners" of s
 - **Latency** — Average, P50, and P99 latencies in microseconds
 
 ### File I/O
-- `--create-file` — Create a test file device
-- `--prep` — Pre-condition device with random data
+- `--create-file` — Create a test file device, filled with random data (one per path when multiple are given)
+- `--prep` — Pre-condition existing devices/files with random data (all devices, in parallel; skipped when `--create-file` is used)
+- Duplicate devices, or raw devices mixed with file paths, are rejected up front
 - Direct I/O mode (`O_DIRECT` on Linux, `FILE_FLAG_NO_BUFFERING` on Windows)
 
 ### Test Selection
@@ -76,6 +80,9 @@ Run all 4 tests or individual tests:
 
 # Custom block sizes
 4c --device \\.\D: --read-tp-bs 256 --write-tp-bs 128
+
+# File system tests for volumes:
+4c --device "E:\test\file1,E:\test\file2" --prep --create-file --file-size 20 
 ```
 
 ## Reporting
