@@ -47,6 +47,21 @@ docker run --rm -v "$PWD:/work" -w /work ghcr.io/rust-cross/cargo-xwin \
 
 Binary: `target/x86_64-pc-windows-msvc/release/4c.exe`
 
+## Signed Windows build
+
+```powershell
+az login
+./Build-Signed.ps1            # build + sign
+./Build-Signed.ps1 -SkipBuild # just sign whats there
+```
+
+Signs `4c.exe` with Azure Artifact Signing (`ci-signing` / `silk-public`). Needs the Artifact Signing Certificate Profile Signer role.
+
+- **macOS/Linux:** cross builds with cargo-xwin in docker, signs with jsign (`brew install jsign`). Output: `target/x86_64-pc-windows-msvc/release/4c.exe`
+- **Windows:** `cargo build`, then signtool via `..\FCA\Sign-Common.ps1` (run FCA's `Prep-SigningHost.ps1` once first). Output: `target\release\4c.exe`
+
+The Linux binary isnt signed, Authenticode is Windows only.
+
 ## Troubleshooting
 
 - **`link.exe not found` / MSVC errors on Windows** — install the Build Tools workload above, then open a fresh terminal.

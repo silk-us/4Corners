@@ -30,3 +30,9 @@ Thumbs.db
 # target
 /target/
 /x86_64-unknown-linux-musl
+
+# signing - local only
+Build-Signed.ps1
+signing.json
+prep-results.json
+*.sig.pem
