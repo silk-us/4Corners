@@ -102,28 +102,28 @@ pub fn write_at_raw(dev: &DeviceHandle, buf: &super::AlignedBuf, offset: u64) ->
     Ok(result as u32)
 }
 
-/// io_uring-based async I/O worker for maximum IOPS
+/// io_uring-based async I/O worker for maximum IOPS.
+/// Each I/O goes to a random target, at a random aligned block inside it.
 pub fn worker_io_uring(
-    device_path: &str,
+    targets: &[(String, u64)],
     io_size: u64,
     queue_depth: u32,
     is_write: bool,
-    test_range: u64,
+    ready: &std::sync::Barrier,
     stop: &std::sync::atomic::AtomicBool,
     metrics: &super::Metrics,
 ) -> io::Result<()> {
-    use io_uring::{opcode, types, IoUring};
+    use io_uring::{opcode, squeue, types, IoUring};
     use std::sync::atomic::Ordering;
 
-    let dev = if is_write {
-        open_device_write(device_path)?
-    } else {
-        open_device_read(device_path)?
-    };
+    // open before the barrier so the timed part is I/O only; always reach it
+    let opened: io::Result<Vec<DeviceHandle>> =
+        targets.iter().map(|(p, _)| if is_write { open_device_write(p) } else { open_device_read(p) }).collect();
+    ready.wait();
+    let devs = opened?;
 
     let qd = queue_depth as usize;
     let sector_size: usize = 4096;
-    let max_offset = test_range / io_size;
 
     // Create io_uring instance
     let mut ring = IoUring::new(queue_depth)?;
@@ -143,44 +143,37 @@ pub fn worker_io_uring(
         buffers.push(buf);
     }
 
-    // Pre-generate random offsets
-    let mut offsets: Vec<u64> = Vec::with_capacity(16384);
+    // Pre-generate random (target, offset) pairs
+    let mut offsets: Vec<(usize, u64)> = Vec::with_capacity(16384);
     for _ in 0..16384 {
-        let rand_val = rand::random::<u64>();
-        let block_num = rand_val % max_offset;
-        offsets.push(block_num * io_size);
+        let t = rand::random::<usize>() % targets.len();
+        let blocks = targets[t].1 / io_size;
+        offsets.push((t, (rand::random::<u64>() % blocks) * io_size));
     }
     let mut offset_idx: usize = 0;
+
+    let sqe = |slot: usize, (t, off): (usize, u64)| -> squeue::Entry {
+        if is_write {
+            opcode::Write::new(types::Fd(devs[t].fd), buffers[slot].ptr, io_size as u32)
+                .offset(off)
+                .build()
+                .user_data(slot as u64)
+        } else {
+            opcode::Read::new(types::Fd(devs[t].fd), buffers[slot].ptr, io_size as u32)
+                .offset(off)
+                .build()
+                .user_data(slot as u64)
+        }
+    };
 
     // Track start times
     let mut start_times: Vec<std::time::Instant> = vec![std::time::Instant::now(); qd];
 
     // Submit initial batch
     for slot in 0..qd {
-        let off = offsets[offset_idx];
+        let entry = sqe(slot, offsets[offset_idx]);
         offset_idx = (offset_idx + 1) % offsets.len();
         start_times[slot] = std::time::Instant::now();
-
-        let entry = if is_write {
-            opcode::Write::new(
-                types::Fd(dev.fd),
-                buffers[slot].ptr,
-                io_size as u32,
-            )
-            .offset(off)
-            .build()
-            .user_data(slot as u64)
-        } else {
-            opcode::Read::new(
-                types::Fd(dev.fd),
-                buffers[slot].ptr,
-                io_size as u32,
-            )
-            .offset(off)
-            .build()
-            .user_data(slot as u64)
-        };
-
         unsafe { ring.submission().push(&entry).ok() };
     }
     ring.submit()?;
@@ -217,30 +210,9 @@ pub fn worker_io_uring(
             }
 
             // Reissue I/O on this slot
-            let off = offsets[offset_idx];
+            let entry = sqe(slot, offsets[offset_idx]);
             offset_idx = (offset_idx + 1) % offsets.len();
             start_times[slot] = std::time::Instant::now();
-
-            let entry = if is_write {
-                opcode::Write::new(
-                    types::Fd(dev.fd),
-                    buffers[slot].ptr,
-                    io_size as u32,
-                )
-                .offset(off)
-                .build()
-                .user_data(slot as u64)
-            } else {
-                opcode::Read::new(
-                    types::Fd(dev.fd),
-                    buffers[slot].ptr,
-                    io_size as u32,
-                )
-                .offset(off)
-                .build()
-                .user_data(slot as u64)
-            };
-
             unsafe { ring.submission().push(&entry).ok() };
         }
         ring.submit()?;

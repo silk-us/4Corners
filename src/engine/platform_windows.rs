@@ -211,32 +211,35 @@ pub fn write_at_raw(dev: &DeviceHandle, buf: &super::AlignedBuf, offset: u64) ->
     Ok(bytes_written)
 }
 
-/// IOCP-based async I/O worker for maximum IOPS
-/// Each call submits `queue_depth` overlapped I/Os and polls for completion
+/// IOCP-based async I/O worker for maximum IOPS.
+/// Every target handle is tied to one completion port; each I/O goes to a
+/// random target at a random aligned block inside it.
 pub fn worker_iocp(
-    device_path: &str,
+    targets: &[(String, u64)],
     io_size: u64,
     queue_depth: u32,
     is_write: bool,
-    test_range: u64,
+    ready: &std::sync::Barrier,
     stop: &std::sync::atomic::AtomicBool,
     metrics: &super::Metrics,
 ) -> io::Result<()> {
-    let dev = if is_write {
-        open_device_write(device_path)?
-    } else {
-        open_device_read(device_path)?
-    };
+    // open before the barrier so the timed part is I/O only; always reach it
+    let opened: io::Result<Vec<DeviceHandle>> =
+        targets.iter().map(|(p, _)| if is_write { open_device_write(p) } else { open_device_read(p) }).collect();
+    ready.wait();
+    let devs = opened?;
 
-    // Create IOCP and associate the file handle
-    let iocp = unsafe { CreateIoCompletionPort(dev.handle, ptr::null_mut(), 0, 0) };
-    if iocp.is_null() {
-        return Err(io::Error::last_os_error());
+    // Create IOCP and associate every handle with it
+    let mut iocp: HANDLE = ptr::null_mut();
+    for d in &devs {
+        iocp = unsafe { CreateIoCompletionPort(d.handle, iocp, 0, 0) };
+        if iocp.is_null() {
+            return Err(io::Error::last_os_error());
+        }
     }
 
     let qd = queue_depth as usize;
     let sector_size: u64 = 4096;
-    let max_offset = test_range / io_size;
 
     // Allocate aligned buffers and overlapped structures per slot
     let mut buffers: Vec<super::AlignedBuf> = Vec::with_capacity(qd);
@@ -257,48 +260,36 @@ pub fn worker_iocp(
         overlappeds.push(unsafe { std::mem::zeroed() });
     }
 
-    // Pre-generate random offsets
-    let mut offsets: Vec<i64> = Vec::with_capacity(16384);
+    // Pre-generate random (target, offset) pairs
+    let mut offsets: Vec<(usize, u64)> = Vec::with_capacity(16384);
     for _ in 0..16384 {
-        let rand_val = rand::random::<u64>();
-        let block_num = rand_val % max_offset;
-        offsets.push((block_num * io_size) as i64);
+        let t = rand::random::<usize>() % targets.len();
+        let blocks = targets[t].1 / io_size;
+        offsets.push((t, (rand::random::<u64>() % blocks) * io_size));
     }
     let mut offset_idx: usize = 0;
+
+    let issue = |ov: &mut OVERLAPPED, buf: &super::AlignedBuf, (t, off): (usize, u64)| {
+        *ov = unsafe { std::mem::zeroed() };
+        ov.Anonymous.Anonymous.Offset = off as u32;
+        ov.Anonymous.Anonymous.OffsetHigh = (off >> 32) as u32;
+        unsafe {
+            if is_write {
+                WriteFile(devs[t].handle, buf.ptr as *const _, io_size as u32, ptr::null_mut(), ov);
+            } else {
+                ReadFile(devs[t].handle, buf.ptr as *mut _, io_size as u32, ptr::null_mut(), ov);
+            }
+        }
+    };
 
     // Track start times for latency measurement
     let mut start_times: Vec<std::time::Instant> = vec![std::time::Instant::now(); qd];
 
     // Submit initial batch of I/Os
     for slot in 0..qd {
-        let off = offsets[offset_idx] as u64;
-        offset_idx = (offset_idx + 1) % offsets.len();
-
-        overlappeds[slot].Anonymous.Anonymous.Offset = off as u32;
-        overlappeds[slot].Anonymous.Anonymous.OffsetHigh = (off >> 32) as u32;
         start_times[slot] = std::time::Instant::now();
-
-        if is_write {
-            unsafe {
-                WriteFile(
-                    dev.handle,
-                    buffers[slot].ptr as *const _,
-                    io_size as u32,
-                    ptr::null_mut(),
-                    &mut overlappeds[slot],
-                );
-            }
-        } else {
-            unsafe {
-                ReadFile(
-                    dev.handle,
-                    buffers[slot].ptr as *mut _,
-                    io_size as u32,
-                    ptr::null_mut(),
-                    &mut overlappeds[slot],
-                );
-            }
-        }
+        issue(&mut overlappeds[slot], &buffers[slot], offsets[offset_idx]);
+        offset_idx = (offset_idx + 1) % offsets.len();
     }
 
     // Completion loop - batch completions with GetQueuedCompletionStatusEx
@@ -363,35 +354,9 @@ pub fn worker_iocp(
             local_bytes += bytes_transferred as u64;
 
             // Reissue I/O on the completed slot
-            let off = offsets[offset_idx] as u64;
-            offset_idx = (offset_idx + 1) % offsets.len();
-
-            overlappeds[slot] = unsafe { std::mem::zeroed() };
-            overlappeds[slot].Anonymous.Anonymous.Offset = off as u32;
-            overlappeds[slot].Anonymous.Anonymous.OffsetHigh = (off >> 32) as u32;
             start_times[slot] = std::time::Instant::now();
-
-            if is_write {
-                unsafe {
-                    WriteFile(
-                        dev.handle,
-                        buffers[slot].ptr as *const _,
-                        io_size as u32,
-                        ptr::null_mut(),
-                        &mut overlappeds[slot],
-                    );
-                }
-            } else {
-                unsafe {
-                    ReadFile(
-                        dev.handle,
-                        buffers[slot].ptr as *mut _,
-                        io_size as u32,
-                        ptr::null_mut(),
-                        &mut overlappeds[slot],
-                    );
-                }
-            }
+            issue(&mut overlappeds[slot], &buffers[slot], offsets[offset_idx]);
+            offset_idx = (offset_idx + 1) % offsets.len();
         }
 
         // Batch update metrics
@@ -418,7 +383,9 @@ pub fn worker_iocp(
     }
 
     // Cancel any outstanding I/Os
-    unsafe { CancelIo(dev.handle) };
+    for d in &devs {
+        unsafe { CancelIo(d.handle) };
+    }
 
     // Drain remaining completions
     loop {

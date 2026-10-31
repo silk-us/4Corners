@@ -12,19 +12,22 @@ pub struct TestResult {
     pub latency_p50_us: f64,
     pub latency_p99_us: f64,
     pub threads: u32,
+    pub devices: u32,
     pub queue_depth: u32,
+    pub in_flight: u32,
     pub block_size_kb: u32,
     pub duration_secs: u32,
 }
 
+// one entry per thread count; a comma list on --*-threads gives several
 #[derive(Debug, Clone, Serialize)]
 pub struct BenchmarkReport {
     pub test_date: DateTime<Local>,
     pub device: String,
-    pub read_throughput: Option<TestResult>,
-    pub write_throughput: Option<TestResult>,
-    pub read_iops: Option<TestResult>,
-    pub write_iops: Option<TestResult>,
+    pub read_throughput: Vec<TestResult>,
+    pub write_throughput: Vec<TestResult>,
+    pub read_iops: Vec<TestResult>,
+    pub write_iops: Vec<TestResult>,
 }
 
 impl BenchmarkReport {
@@ -32,10 +35,10 @@ impl BenchmarkReport {
         Self {
             test_date: Local::now(),
             device: device.to_string(),
-            read_throughput: None,
-            write_throughput: None,
-            read_iops: None,
-            write_iops: None,
+            read_throughput: Vec::new(),
+            write_throughput: Vec::new(),
+            read_iops: Vec::new(),
+            write_iops: Vec::new(),
         }
     }
 
@@ -50,21 +53,23 @@ impl BenchmarkReport {
         ));
         s.push_str(&format!("Device: {}\n\n", self.device));
 
-        if let Some(r) = &self.read_throughput {
-            s.push_str("Read Throughput Test:\n");
-            format_result(&mut s, r);
-        }
-        if let Some(r) = &self.write_throughput {
-            s.push_str("Write Throughput Test:\n");
-            format_result(&mut s, r);
-        }
-        if let Some(r) = &self.read_iops {
-            s.push_str("Read IOPS Test:\n");
-            format_result(&mut s, r);
-        }
-        if let Some(r) = &self.write_iops {
-            s.push_str("Write IOPS Test:\n");
-            format_result(&mut s, r);
+        for (name, results) in [
+            ("Read Throughput Test", &self.read_throughput),
+            ("Write Throughput Test", &self.write_throughput),
+            ("Read IOPS Test", &self.read_iops),
+            ("Write IOPS Test", &self.write_iops),
+        ] {
+            match results.len() {
+                0 => {}
+                1 => {
+                    s.push_str(&format!("{}:\n", name));
+                    format_result(&mut s, &results[0]);
+                }
+                _ => {
+                    s.push_str(&format!("{} (thread sweep):\n", name));
+                    format_sweep(&mut s, results);
+                }
+            }
         }
 
         s.push_str("========================================\n");
@@ -87,9 +92,18 @@ impl BenchmarkReport {
     }
 }
 
+fn threads_text(r: &TestResult) -> String {
+    if r.devices > 1 {
+        format!("{} (spread over {} devices)", r.threads, r.devices)
+    } else {
+        r.threads.to_string()
+    }
+}
+
 fn format_result(s: &mut String, r: &TestResult) {
-    s.push_str(&format!("  Threads:         {}\n", r.threads));
+    s.push_str(&format!("  Threads:         {}\n", threads_text(r)));
     s.push_str(&format!("  Queue Depth:     {}\n", r.queue_depth));
+    s.push_str(&format!("  I/Os in Flight:  {}\n", r.in_flight));
     s.push_str(&format!("  Block Size:      {} KB\n", r.block_size_kb));
     s.push_str(&format!("  Duration:        {} seconds\n", r.duration_secs));
     s.push_str(&format!("  Throughput:    {:>10.2} MB/s\n", r.throughput_mbps));
@@ -106,5 +120,43 @@ fn format_result(s: &mut String, r: &TestResult) {
         "  P99 Latency:   {:>10.2} us\n",
         r.latency_p99_us
     ));
+    s.push('\n');
+}
+
+// the knee: first step where IOPS grew under 30% while p50 rose over 50%
+fn knee(results: &[TestResult]) -> Option<usize> {
+    (1..results.len()).find(|&i| {
+        let (a, b) = (&results[i - 1], &results[i]);
+        a.iops > 0.0
+            && a.latency_p50_us > 0.0
+            && b.iops / a.iops < 1.30
+            && b.latency_p50_us / a.latency_p50_us > 1.50
+    })
+}
+
+fn format_sweep(s: &mut String, results: &[TestResult]) {
+    let r0 = &results[0];
+    s.push_str(&format!(
+        "  Queue Depth: {}   Block Size: {} KB   Duration: {} seconds each\n\n",
+        r0.queue_depth, r0.block_size_kb, r0.duration_secs
+    ));
+    s.push_str("   Threads  In Flight        MB/s        IOPS     Avg us     P50 us     P99 us\n");
+    let k = knee(results);
+    for (i, r) in results.iter().enumerate() {
+        s.push_str(&format!(
+            "  {:>8} {:>10} {:>11.2} {:>11.0} {:>10.1} {:>10.1} {:>10.1}{}\n",
+            r.threads,
+            r.in_flight,
+            r.throughput_mbps,
+            r.iops,
+            r.latency_avg_us,
+            r.latency_p50_us,
+            r.latency_p99_us,
+            if k == Some(i) { "  <- knee: latency up, IOPS flat" } else { "" }
+        ));
+    }
+    if r0.devices > 1 {
+        s.push_str(&format!("  Threads are spread over {} devices\n", r0.devices));
+    }
     s.push('\n');
 }

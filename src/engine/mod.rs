@@ -1,4 +1,5 @@
 mod worker;
+pub mod files;
 
 #[cfg(windows)]
 mod platform_windows;
@@ -9,7 +10,7 @@ use crate::report::TestResult;
 use std::io;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
 /// Shared metrics collected by all worker threads
@@ -58,94 +59,139 @@ impl Metrics {
     }
 }
 
-/// Configuration for a benchmark test (single or multiple devices)
-pub struct TestConfig {
-    pub device_paths: Vec<String>,
+/// What a test runs against: devices (threads per device) or a file set (threads in total)
+pub enum Target {
+    Devices(Vec<String>),
+    Files { paths: Vec<String>, size: u64 },
+}
+
+/// Configuration for a benchmark test
+pub struct TestConfig<'a> {
+    pub target: &'a Target,
     pub io_size: u64,
-    pub threads: u32,  // per device
+    pub threads: u32,  // in total, or per device with per_device
+    pub per_device: bool,
     pub queue_depth: u32,
     pub duration_secs: u32,
     pub is_write: bool,
 }
 
-/// Run a benchmark test on one or more devices and return the result
+/// Run a benchmark test and return the result
 pub fn run_test(config: &TestConfig) -> io::Result<TestResult> {
     let test_type = if config.is_write { "Write" } else { "Read" };
     let io_kb = config.io_size / 1024;
-
-    if config.device_paths.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "No devices specified",
-        ));
-    }
+    let devices = match config.target {
+        Target::Devices(paths) => paths.len() as u32,
+        Target::Files { .. } => 1,
+    };
+    let total_threads = if config.per_device { config.threads * devices } else { config.threads };
+    let spread = if devices > 1 { format!(" over {} devices", devices) } else { String::new() };
 
     println!(
-        "  {} test: {}KB blocks, {} threads per device, QD={}, {} seconds",
-        test_type, io_kb, config.threads, config.queue_depth, config.duration_secs
+        "  {} test: {}KB blocks, {} threads{}, QD={}, {} I/Os in flight, {} seconds",
+        test_type,
+        io_kb,
+        total_threads,
+        spread,
+        config.queue_depth,
+        total_threads * config.queue_depth,
+        config.duration_secs
     );
 
     let metrics = Arc::new(Metrics::new());
     let stop = Arc::new(AtomicBool::new(false));
     let duration = Duration::from_secs(config.duration_secs as u64);
 
-    // Collect device info (size and path)
-    let mut device_info = Vec::new();
-    let mut total_size: u64 = 0;
-
-    for device_path in &config.device_paths {
-        let device_size = get_device_size(device_path)?;
-        if device_size == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("Device {} size is 0", device_path),
-            ));
-        }
-        device_info.push((device_path.clone(), device_size));
-        total_size += device_size;
-    }
-
-    println!(
-        "  Total device size: {:.2} GB ({} device{})",
-        total_size as f64 / (1024.0 * 1024.0 * 1024.0),
-        config.device_paths.len(),
-        crate::plural(config.device_paths.len())
-    );
-
-    let start = Instant::now();
-
-    // Spawn worker threads for all devices
-    let mut handles = Vec::new();
-    let mut global_thread_id = 0u32;
-
-    for (device_path, device_size) in device_info {
-        for _thread_id in 0..config.threads {
-            let metrics = Arc::clone(&metrics);
-            let stop = Arc::clone(&stop);
-            let dev_path = device_path.clone();
-            let io_size = config.io_size;
-            let queue_depth = config.queue_depth;
-            let is_write = config.is_write;
-            let local_global_id = global_thread_id;
-
-            let handle = std::thread::spawn(move || {
-                if let Err(e) = worker::run_worker(
-                    local_global_id,
-                    &dev_path,
-                    io_size,
-                    queue_depth,
-                    is_write,
-                    device_size,
-                    &stop,
-                    &metrics,
-                ) {
-                    eprintln!("  Worker {} error: {}", local_global_id, e);
+    // what each worker thread gets: one device, or its slice of the files
+    let plan: Vec<Vec<(String, u64)>> = match config.target {
+        Target::Devices(paths) => {
+            if paths.is_empty() {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, "No devices specified"));
+            }
+            if total_threads < devices {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{} threads can't cover {} devices; use at least {}", total_threads, devices, devices),
+                ));
+            }
+            let mut sizes = Vec::new();
+            let mut total_size: u64 = 0;
+            for path in paths {
+                let size = get_device_size(path)?;
+                if size == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("Device {} size is 0", path),
+                    ));
                 }
-            });
-            handles.push(handle);
-            global_thread_id += 1;
+                total_size += size;
+                sizes.push(size);
+            }
+            // thread i goes to device i % n
+            let plan: Vec<_> = (0..total_threads as usize)
+                .map(|i| vec![(paths[i % paths.len()].clone(), sizes[i % paths.len()])])
+                .collect();
+            println!(
+                "  Total device size: {:.2} GB ({} device{})",
+                total_size as f64 / (1024.0 * 1024.0 * 1024.0),
+                paths.len(),
+                crate::plural(paths.len())
+            );
+            plan
         }
+        Target::Files { paths, size } => {
+            let t = total_threads as usize;
+            let n = paths.len();
+            println!(
+                "  {} files x {} KB ({:.2} GB), opening them...",
+                n,
+                size / 1024,
+                (n as u64 * size) as f64 / (1024.0 * 1024.0 * 1024.0)
+            );
+            // thread i takes files i, i+t, ...; more threads than files share them
+            (0..t)
+                .map(|i| {
+                    if t >= n {
+                        vec![(paths[i % n].clone(), *size)]
+                    } else {
+                        paths.iter().skip(i).step_by(t).map(|p| (p.clone(), *size)).collect()
+                    }
+                })
+                .collect()
+        }
+    };
+
+    // workers open everything first; the clock starts when all are ready
+    let ready = Arc::new(Barrier::new(plan.len() + 1));
+    let mut handles = Vec::new();
+
+    for (id, targets) in plan.into_iter().enumerate() {
+        let metrics = Arc::clone(&metrics);
+        let stop = Arc::clone(&stop);
+        let ready = Arc::clone(&ready);
+        let io_size = config.io_size;
+        let queue_depth = config.queue_depth;
+        let is_write = config.is_write;
+
+        let handle = std::thread::spawn(move || {
+            if let Err(e) = worker::run_worker(
+                id as u32,
+                &targets,
+                io_size,
+                queue_depth,
+                is_write,
+                &ready,
+                &stop,
+                &metrics,
+            ) {
+                eprintln!("  Worker {} error: {}", id, e);
+            }
+        });
+        handles.push(handle);
     }
+
+    ready.wait();
+    let start = Instant::now();
 
     // Progress reporting
     let report_interval = Duration::from_secs(5);
@@ -212,8 +258,10 @@ pub fn run_test(config: &TestConfig) -> io::Result<TestResult> {
         latency_avg_us: avg_lat_us,
         latency_p50_us: p50_us,
         latency_p99_us: p99_us,
-        threads: config.threads,
+        threads: total_threads,
+        devices,
         queue_depth: config.queue_depth,
+        in_flight: total_threads * config.queue_depth,
         block_size_kb: (config.io_size / 1024) as u32,
         duration_secs: config.duration_secs,
     })

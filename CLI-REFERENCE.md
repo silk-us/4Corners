@@ -1,309 +1,197 @@
 # 4C Disk Benchmark - CLI Reference
 
-## Overview
+4c measures the four corners of storage performance on one or more devices, or on a set of many files:
 
-`4c` is a cross-platform disk I/O benchmark tool that measures the "4 corners" of storage performance:
+| Test | `--tests` name | Default block | Default threads | What it measures |
+|------|----------------|---------------|-----------------|------------------|
+| Read throughput | `read-tp` | 128 KB | 120 | Large-block random reads (MB/s) |
+| Write throughput | `write-tp` | 64 KB | 64 | Large-block random writes (MB/s) |
+| Read IOPS | `read-iops` | 4 KB | 480 | Small-block random reads (ops/s) |
+| Write IOPS | `write-iops` | 4 KB | 480 | Small-block random writes (ops/s) |
 
-- **Read Throughput** — Maximum read bandwidth (large block sequential)
-- **Write Throughput** — Maximum write bandwidth (large block sequential)
-- **Read IOPS** — Random read operations per second (small block random)
-- **Write IOPS** — Random write operations per second (small block random)
-
-Each test reports throughput (MB/s), IOPS, and latency (avg, p50, p99).
+Every test reports MB/s, IOPS and latency (average, p50, p99). I/O is direct (no OS cache) and asynchronous: IOCP on Windows, io_uring on Linux.
 
 ## Usage
 
 ```
-4c --device <DEVICE> [--device <DEVICE2> ...] [OPTIONS]
+4c --device <PATH>[,<PATH>...] [OPTIONS]
+4c --filepath <FOLDER> --filecount <N> --filesizek <KB> [OPTIONS]
 ```
 
-## Required
+Give exactly one of `--device` or `--filepath`. 4c refuses both together, and refuses neither.
 
-| Option | Description |
-|--------|-------------|
-| `-d`, `--device <PATH>` | Device or file path to benchmark. Can be specified multiple times or comma-separated for multi-device testing. |
+| Target | Option | Use it for |
+|--------|--------|------------|
+| Devices | `-d`, `--device <PATH>` | Raw disks, volumes, LUNs, or a few large test files. Repeat the option or separate paths with commas |
+| File set | `--filepath <FOLDER>` | Many files in a folder, for example an NFS or SMB share. Needs `--filecount` and `--filesizek`. See [File-set mode](#file-set-mode) |
 
-### Windows device paths
+## Threads and concurrency
+
+Load comes from threads. Each thread keeps `QD` I/Os in flight, so the total load is:
+
 ```
-\\.\PhysicalDrive1       Physical drive (full path)
-4                        Physical drive (shorthand - converts to \\.\PhysicalDrive4)
-\\.\D:                   Volume
-C:\test\benchmark.dat    File
-```
-
-**Note:** On Windows, device numbers are automatically converted to full paths. Both `4` and `\\.\PhysicalDrive4` refer to the same device.
-
-### Linux device paths
-```
-/dev/sdb                 SATA/SAS drive
-/dev/nvme0n1             NVMe drive
-/mnt/storage/bench.dat   File
+I/Os in flight = threads x queue depth
 ```
 
-## Test Selection
+**Thread counts are the total for the run** in every mode. With four devices and `--read-iops-threads 480`, each device gets 120 threads (thread `i` goes to device `i % devices`). With a file set, the threads share the files. If there are fewer threads than devices, 4c stops with an error rather than leave a device idle.
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--tests <LIST>` | `all` | Comma-separated list of tests to run |
+| `--read-tp-threads <N[,N...]>` | `120` | Threads for read throughput |
+| `--write-tp-threads <N[,N...]>` | `64` | Threads for write throughput |
+| `--read-iops-threads <N[,N...]>` | `480` | Threads for read IOPS |
+| `--write-iops-threads <N[,N...]>` | `480` | Threads for write IOPS |
+| `--per-device` | off | Treat the thread counts as per device, the meaning before 0.9.1. Device mode only |
 
-Values: `all`, `read-tp`, `write-tp`, `read-iops`, `write-iops`
+The defaults are sized for four devices, which is how 4c is usually run. With one device, the same totals all go to that device.
 
-```powershell
-# Run all 4 tests
-4c --device \\.\D:
+### Thread sweeps
 
-# IOPS tests only
-4c --device \\.\D: --tests read-iops,write-iops
+Give a comma list to run that test once per thread count, in order:
 
-# Read tests only
-4c --device \\.\D: --tests read-tp,read-iops
-```
-
-## Duration
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `--duration <SECS>` | `30` | Duration of each test in seconds |
-
-## Thread Configuration
-
-Each test type uses its own thread count. More threads generate more concurrent I/O.
-
-**Important:** When testing multiple devices, thread counts are **per device**. Total threads = devices × threads.
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `--read-tp-threads` | `30` | Threads per device for read throughput test |
-| `--write-tp-threads` | `16` | Threads per device for write throughput test |
-| `--read-iops-threads` | `120` | Threads per device for read IOPS test |
-| `--write-iops-threads` | `120` | Threads per device for write IOPS test |
-
-### Guidelines by device type
-
-| Device | Throughput Threads | IOPS Threads |
-|--------|--------------------|--------------|
-| HDD | 8–16 | 32–64 |
-| SATA SSD | 16–32 | 64–128 |
-| NVMe SSD | 32–64 | 128–256 |
-| High-end NVMe | 64–128 | 256–512 |
-
-**Multi-device example:** Testing 3 devices with 120 IOPS threads spawns 360 total threads (120 per device).
-
-## Queue Depth
-
-Queue depth controls how many I/Os each thread keeps in flight simultaneously. Higher queue depth drives more parallelism per thread. This is a key parameter for IOPS performance.
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `--read-tp-qd` | `1` | Queue depth per thread for read throughput |
-| `--write-tp-qd` | `1` | Queue depth per thread for write throughput |
-| `--read-iops-qd` | `1` | Queue depth per thread for read IOPS |
-| `--write-iops-qd` | `1` | Queue depth per thread for write IOPS |
-
-Total concurrent I/Os = threads × queue depth × devices. For example, the default IOPS config runs 120 threads × 1 QD × 1 device = 120 concurrent I/Os.
-
-## Block Size
-
-Block size is the amount of data transferred per I/O operation, specified in KB.
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `--read-tp-bs` | `128` | Block size (KB) for read throughput |
-| `--write-tp-bs` | `64` | Block size (KB) for write throughput |
-| `--read-iops-bs` | `4` | Block size (KB) for read IOPS |
-| `--write-iops-bs` | `4` | Block size (KB) for write IOPS |
-
-## File & Device Preparation
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `--create-file` | off | Create a file device before testing |
-| `--file-size <GB>` | `10` | Size of the file to create (in GB) |
-| `--prep` | off | Write random data to device before testing |
-
-Use `--create-file` to benchmark against a file instead of a raw device. Use `--prep` to pre-condition a device with random data for accurate first-write performance.
-
-Both apply to every device in the list and run in parallel. Notes:
-
-- `--create-file` already fills each new file with random data, so `--prep` is skipped when both flags are given.
-- `--create-file` only works with file paths, not raw devices.
-- `--prep` works fine on existing files — handy for re-normalizing a file after a write test.
-
-## Multi-Device Testing
-
-Test multiple devices simultaneously to achieve aggregate performance across devices. Results are combined:
-
-- **IOPS**: Summed across all devices
-- **Throughput (MB/s)**: Summed across all devices
-- **Latency**: Averaged across all devices
-
-### Specifying Multiple Devices
-
-The device list is checked before anything runs. Listing the same device twice, or mixing raw devices with file paths in one run, is rejected with an error.
-
-**Windows:**
-```powershell
-# Multiple --device flags
-4c --device 4 --device 5 --device 6
-
-# Comma-separated (Windows shorthand)
-4c --device "4,5,6"
-
-# Full paths
-4c --device \\.\PhysicalDrive4 --device \\.\PhysicalDrive5
-
-# Mixed format
-4c --device "4,5" --device \\.\PhysicalDrive6
-```
-
-**Linux:**
 ```bash
-# Multiple --device flags
-sudo ./4c --device /dev/sdb --device /dev/sdc --device /dev/sdd
-
-# Comma-separated
-sudo ./4c --device "/dev/sdb,/dev/sdc,/dev/sdd"
-
-# NVMe devices
-sudo ./4c --device /dev/nvme0n1 --device /dev/nvme1n1
-
-# Mixed NVMe and SATA
-sudo ./4c --device /dev/sdb --device /dev/nvme0n1
+4c --filepath /mnt/test01 --filecount 32000 --filesizek 4 --tests read-iops,write-iops \
+   --read-iops-threads 120,240,480,960 --write-iops-threads 120,240,480,960
 ```
 
-### Use Cases
+Each test sweeps its own list; a test given one number runs once. The report shows a table per swept test and marks the **knee**: the first step where IOPS grew less than 30% while p50 latency rose more than 50%. Past the knee, more threads only add queueing. The step before it is the useful number.
 
-**Saturate storage fabric:** When a single device can't fully load your HBA/NIC/fabric, test multiple devices to measure aggregate capacity.
+### Queue depth
 
-**Parallel iSCSI targets:** Test multiple LUNs from the same iSCSI target to measure target-level performance.
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--read-tp-qd <N>` | `1` | I/Os each read throughput thread keeps in flight |
+| `--write-tp-qd <N>` | `1` | Same, write throughput |
+| `--read-iops-qd <N>` | `1` | Same, read IOPS |
+| `--write-iops-qd <N>` | `1` | Same, write IOPS |
 
-**RAID array testing:** Test multiple drives in a RAID setup to measure controller throughput.
+QD 1 with many threads is the default and matches how most applications behave. Raising QD adds load without adding threads, at the cost of latency.
+
+## Block size and duration
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--read-tp-bs <KB>` | `128` | Block size for read throughput |
+| `--write-tp-bs <KB>` | `64` | Block size for write throughput |
+| `--read-iops-bs <KB>` | `4` | Block size for read IOPS |
+| `--write-iops-bs <KB>` | `4` | Block size for write IOPS |
+| `--duration <SECS>` | `30` | Length of each test (each step of a sweep) |
+| `--tests <LIST>` | `all` | Comma list of `read-tp`, `write-tp`, `read-iops`, `write-iops`, or `all` |
+
+## Device mode
+
+### Paths
+
+| Windows | Linux | What |
+|---------|-------|------|
+| `4` or `\\.\PhysicalDrive4` | `/dev/sdb`, `/dev/nvme0n1` | Physical disk |
+| `\\.\D:` | | Volume |
+| `C:\test\bench.dat` | `/mnt/storage/bench.dat` | File |
+
+On Windows a bare number is turned into `\\.\PhysicalDriveN`. Listing a device twice, or mixing raw devices with files in one run, is refused.
+
+With several devices the results are combined: IOPS and MB/s are summed, latency is over all I/Os.
+
+### Test files and prep
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--create-file` | off | Create each `--device` path as a file, filled with random data |
+| `--file-size <GB>` | `10` | Size of each created file |
+| `--prep` | off | Write random data over each device before testing |
+
+Both run on every device in parallel. `--prep` is skipped after `--create-file`, which already writes random data. `--create-file` only works on file paths.
+
+## File-set mode
+
+Benchmarks many files instead of a few devices.
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--filepath <FOLDER>` | | Folder the test files go in. Must exist |
+| `--filecount <N>` | | Number of files (required) |
+| `--filesizek <KB>` | | Size of each file in KB, a multiple of 4 (required) |
+| `--recreate` | off | Make a new set even if a matching one is there |
+| `--cleanup` | off | Delete the set when the run is done |
+
+- **Layout.** Files go in `<filepath>/4c-files/d000/f000000.dat`, 1,000 per folder, filled with random data. Creation runs 64 files at a time and reports files/s and MB/s.
+- **Reuse.** A `manifest.json` records the count and size. The next run with the same `--filecount` and `--filesizek` reuses the set, so creation happens once. `--recreate` forces a new set.
+- **I/O pattern.** Thread `i` takes files `i`, `i + threads`, and so on (with more threads than files, threads share files). Each I/O picks a random file from the thread's share, then a random block inside it. With `--filesizek 4` and 4 KB blocks, every I/O is a whole file.
+- **Opens are not timed.** Every thread opens its files before the clock starts and keeps them open, so results measure I/O, not file opens.
+- **Checks before anything runs.** Each selected test's block size must fit in a file: `--filesizek 4` with the default read-tp (128 KB) stops with an error, so use `--tests read-iops,write-iops` or a smaller `--read-tp-bs`. Free space is checked before creating. On Linux, 4c raises its open-file limit and stops with a message if it's still too low.
+- `--create-file`, `--file-size`, `--prep` and `--per-device` are device options and can't be used with `--filepath`.
 
 ## Examples
 
-### Quick 30-second test on a volume
 ```powershell
-4c --device \\.\D: --duration 30
-```
+# Windows: physical disk 4, all four tests with the defaults
+4c --device 4
 
-### Create a 20 GB test file and benchmark it
-```powershell
-4c --device C:\test\bench.dat --create-file --file-size 20
-```
+# Four iSCSI LUNs, IOPS only, sweep the load to find the knee
+4c --device "10,11,12,13" --tests read-iops,write-iops --read-iops-threads 240,480,960 --write-iops-threads 240,480,960
 
-### IOPS-focused test with higher queue depth
-```powershell
-4c --device \\.\PhysicalDrive1 --tests read-iops,write-iops --read-iops-qd 64 --write-iops-qd 64
-```
-
-### High-thread NVMe test
-```powershell
-4c --device \\.\PhysicalDrive1 --read-iops-threads 256 --write-iops-threads 256
-```
-
-### Read-only test (safe for production volumes)
-```powershell
+# Read-only run on a live volume
 4c --device \\.\D: --tests read-tp,read-iops
+
+# Two 20 GB test files, created first
+4c --device "E:\test\file1,E:\test\file2" --create-file --file-size 20
+
+# SMB share, 10,000 x 64 KB files
+4c --filepath \\fileserver\share\bench --filecount 10000 --filesizek 64
 ```
 
-### Prep device then run full benchmark
-```powershell
-4c --device \\.\PhysicalDrive1 --prep
-```
-
-### Linux: NVMe full test
 ```bash
+# Linux: NVMe, 2 minutes per test
 sudo ./4c --device /dev/nvme0n1 --duration 120
-```
 
-### Multi-device: Test three drives together (Windows shorthand)
-```powershell
-4c --device "4,5,6" --duration 60
-```
+# Four 10 GB files on an NFS mount, old per-device thread meaning (120 x 4 = 480 IOPS threads)
+./4c --device "/mnt/test01/f1,/mnt/test01/f2,/mnt/test01/f3,/mnt/test01/f4" --read-iops-threads 120 --write-iops-threads 120 --per-device
 
-### Multi-device: IOPS test across multiple iSCSI LUNs (Windows)
-```powershell
-4c --device 10 --device 11 --device 12 --tests read-iops,write-iops
-```
+# 32,000 x 4 KB files on an NFS mount, IOPS sweep
+./4c --filepath /mnt/test01 --filecount 32000 --filesizek 4 --tests read-iops,write-iops \
+     --read-iops-threads 120,240,480,960 --write-iops-threads 120,240,480,960
 
-### Multi-device: Saturate fabric with high thread count (Windows)
-```powershell
-4c --device "4,5,6,7" --read-iops-threads 256 --write-iops-threads 256
-```
-
-### Multi-device: Test three drives together (Linux)
-```bash
-sudo ./4c --device "/dev/sdb,/dev/sdc,/dev/sdd" --duration 60
-```
-
-### Multi-device: IOPS test across multiple NVMe drives (Linux)
-```bash
-sudo ./4c --device /dev/nvme0n1 --device /dev/nvme1n1 --device /dev/nvme2n1 --tests read-iops,write-iops
-```
-
-### Multi-device: Prep and benchmark multiple drives in parallel (Linux)
-```bash
-sudo ./4c --device "/dev/sdb,/dev/sdc,/dev/sdd" --prep --read-iops-threads 256 --write-iops-threads 256
-```
-
-### Multi-device: Create two 20 GB test files, then benchmark (Windows)
-```powershell
-./4c --device "E:\test\file1,E:\test\file2" --create-file --file-size 20
-```
-
-### Multi-device: Re-prep existing test files before another run (Windows)
-```powershell
-./4c --device "E:\test\file1,E:\test\file2" --prep
+# 4,000 x 4 MB files, all four tests, delete them afterwards
+./4c --filepath /mnt/test01 --filecount 4000 --filesizek 4096 --cleanup
 ```
 
 ## Output
 
 ### Console
-Real-time progress is printed every 5 seconds during each test:
 
-**Single device:**
+Progress every 5 seconds, then one RESULT line per test (per step of a sweep):
+
 ```
 Running Read IOPS Test...
-  Read test: 4KB blocks, 120 threads per device, QD=32, 60 seconds
-  Total device size: 476.94 GB (1 device)
-    5s:  1234.56 MB/s |     316045 IOPS |    121.3 us avg lat
-   10s:  1245.67 MB/s |     318891 IOPS |    119.8 us avg lat
+  Read test: 4KB blocks, 480 threads over 4 devices, QD=1, 480 I/Os in flight, 30 seconds
+  Total device size: 40.00 GB (4 devices)
+    5s:   612.40 MB/s |     156774 IOPS |   3061.2 us avg lat
   ...
-  RESULT: 1240.12 MB/s | 317471 IOPS | avg 120.5 us | p50 98.2 us | p99 412.7 us
+  RESULT: 625.41 MB/s | 160105 IOPS | avg 2899.0 us | p50 1749.1 us | p99 13661.9 us
 ```
 
-**Multiple devices:**
+### Report files
+
+Each run writes `4c-report-YYYYMMDD-HHMMSS.txt` and `.json` to the current folder.
+
+A test run once is reported as before, with threads, queue depth and I/Os in flight. A swept test gets a table:
+
 ```
-Running Read IOPS Test...
-  Read test: 4KB blocks, 120 threads per device, QD=32, 60 seconds
-  Total device size: 1430.82 GB (3 devices)
-    5s:  3678.90 MB/s |     941800 IOPS |    122.5 us avg lat
-   10s:  3701.23 MB/s |     947515 IOPS |    121.1 us avg lat
-  ...
-  RESULT: 3692.45 MB/s | 945907 IOPS | avg 121.8 us | p50 99.3 us | p99 415.2 us
+Read IOPS Test (thread sweep):
+  Queue Depth: 1   Block Size: 4 KB   Duration: 30 seconds each
+
+   Threads  In Flight        MB/s        IOPS     Avg us     P50 us     P99 us
+       120        120      265.73       68028     1640.7     1448.8     4944.8
+       240        240         ...
 ```
 
-Metrics are aggregated: IOPS and throughput are summed, latency is averaged.
+In the JSON, `read_throughput`, `write_throughput`, `read_iops` and `write_iops` are arrays with one entry per thread count (one entry for a single run). Each entry has `threads` (total), `devices`, `queue_depth`, `in_flight`, `block_size_kb`, `duration_secs`, `throughput_mbps`, `iops` and the three latencies in microseconds. Before 0.9.1 these were single objects.
 
-### Report Files
-Two files are saved to the current directory after each run:
+## Permissions and safety
 
-- `4c-report-YYYYMMDD-HHMMSS.txt` — Human-readable text report
-- `4c-report-YYYYMMDD-HHMMSS.json` — Machine-readable JSON report
-
-## Permissions
-
-- **Windows**: Administrator required for raw devices (`\\.\PhysicalDrive#`, `\\.\D:`). Files work as regular user.
-- **Linux**: Root/sudo required for block devices (`/dev/sd*`, `/dev/nvme*`). Files work as regular user.
-
-## Safety
-
-Write tests are destructive. They overwrite data on the target device. Do not run write tests against drives containing data you need. Use `--tests read-tp,read-iops` for read-only testing on production systems.
+- Raw devices need Administrator (Windows) or root (Linux). Files and file sets work as a regular user.
+- Write tests and `--prep` overwrite the target. Use empty disks, test files or a file set, or run `--tests read-tp,read-iops` on live data.
 
 ## Building
 
-```
-cargo build --release
-```
-
-Binary output: `target/release/4c.exe` (Windows) or `target/release/4c` (Linux).
+See [BUILD.md](BUILD.md). The signed Windows build is `./Build-Signed.ps1`.
